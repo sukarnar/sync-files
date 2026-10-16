@@ -460,7 +460,14 @@ function Invoke-MappingSync {
 
 #region ---------------- Main ----------------
 try {
-    $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    # Accept Windows paths written with single backslashes (E:\Shares) as well as JSON-escaped ones (E:\\Shares).
+    # Every lone "\" is treated as a literal backslash; "\\" and \" are left as they are.
+    $raw = Get-Content -LiteralPath $ConfigPath -Raw
+    $raw = [regex]::Replace($raw, '\\\\|\\(?!")', {
+        param($m) if ($m.Value.Length -eq 2) { $m.Value } else { '\\' }
+    })
+    try { $config = $raw | ConvertFrom-Json }
+    catch { throw "Config file '$ConfigPath' is not valid JSON: $($_.Exception.Message)" }
     foreach ($req in 'StateDir', 'LogDir', 'Mappings') {
         if (-not $config.PSObject.Properties[$req]) { throw "Config is missing '$req'" }
     }
@@ -492,6 +499,11 @@ try {
         if ($names.ContainsKey($m.Name)) { throw "Duplicate mapping name '$($m.Name)'" }
         $names[$m.Name] = $true
         if ($OnlyMapping -and ($OnlyMapping -notcontains $m.Name)) { continue }
+
+        # "\\SRV\share" typed with single backslashes in the config arrives as "\SRV\share"; restore the UNC prefix
+        foreach ($p in 'Source', 'Target') {
+            if ($m.$p -match '^\\[^\\]') { $m.$p = '\' + $m.$p }
+        }
 
         $settings = @{
             Include           = @(Get-Setting $m $defaults 'Include' @('*'))
