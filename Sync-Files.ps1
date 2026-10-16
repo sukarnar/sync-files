@@ -9,7 +9,11 @@
     - Change tracking through a per-mapping state manifest (size + last-write time, optional SHA256)
     - Detects New / Modified / Repair (target drifted) / Relocate (rules changed) / Deleted
     - Adopts files already at the target (same size + time) without recopying them, so a pre-seeded target is reused
-    - Atomic copy (temp file + replace), retries locked files, skips files still being written
+    - Before every copy, checks whether the target already matches the source (CompareMode: Content = size + time
+      or SHA256; Version = exe/dll file version, content for other files) and skips the copy if it does
+    - Atomic copy (temp file), retries locked files, skips files still being written
+    - Existing target files are renamed to <name>.old_<RunId> (never overwritten), so the new copy is a fresh
+      file with the folder's inherited permissions; KeepReplacedFiles=false removes the renamed file afterwards
     - Safe deletes: only files this tool copied, never after an incomplete scan, capped by MaxDeletePercent
     - Dry run, single-instance lock, run log + change audit CSV, checkpointed state, exit codes for schedulers
 
@@ -219,10 +223,56 @@ function Write-State {
 }
 #endregion
 
+#region ---------------- Same-file check ----------------
+# Decides whether the target already holds the same file as the source, so the copy can be skipped.
+#   Content : same size AND (same modified time within 2s OR same SHA256 hash)
+#   Version : for files with a version resource (exe, dll, msi...) same FileVersion + ProductVersion;
+#             files without version info fall back to Content
+#   None    : never skip
+# Returns a short reason when they are the same, or $null when the file must be copied.
+function Test-SameFile {
+    param([string]$Src, [string]$Dst, [string]$Mode)
+    if ($Mode -eq 'None') { return $null }
+
+    $d = New-Object IO.FileInfo $Dst
+    if (-not $d.Exists) { return $null }
+    $s = New-Object IO.FileInfo $Src
+
+    if ($Mode -eq 'Version') {
+        try {
+            $sv = [Diagnostics.FileVersionInfo]::GetVersionInfo($Src)
+            if ($sv.FileVersion -or $sv.ProductVersion) {
+                $dv = [Diagnostics.FileVersionInfo]::GetVersionInfo($Dst)
+                if ($sv.FileVersion -eq $dv.FileVersion -and $sv.ProductVersion -eq $dv.ProductVersion) {
+                    return "same version $($sv.FileVersion)"
+                }
+                return $null
+            }
+        }
+        catch { }   # unreadable version info: fall back to content
+    }
+
+    if ($s.Length -ne $d.Length) { return $null }
+    if ([Math]::Abs($s.LastWriteTimeUtc.Ticks - $d.LastWriteTimeUtc.Ticks) -le [TimeSpan]::FromSeconds(2).Ticks) {
+        return 'same size and timestamp'
+    }
+    try {
+        $h1 = (Get-FileHash -LiteralPath $Src -Algorithm SHA256).Hash
+        $h2 = (Get-FileHash -LiteralPath $Dst -Algorithm SHA256).Hash
+        if ($h1 -eq $h2) { return 'same content (SHA256)' }
+    }
+    catch { }
+    return $null
+}
+#endregion
+
 #region ---------------- File operations ----------------
 # Copy to <dest>.synctmp, verify, then swap in. The target never holds a partial file.
+# An existing target file is never written over: it is renamed to <name>.old_<RunId> first, and the source
+# copy is placed as a brand-new file (which picks up the target folder's inherited permissions).
+# Renaming only needs delete rights on the file or folder, not write rights on the old file.
 function Copy-FileAtomic {
-    param([string]$Src, [string]$Dst, [bool]$VerifyHash, [int]$RetryCount, [int]$RetryDelay)
+    param([string]$Src, [string]$Dst, [bool]$VerifyHash, [int]$RetryCount, [int]$RetryDelay, [bool]$KeepReplaced)
 
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Dst))
     $tmp = $Dst + '.synctmp'
@@ -248,17 +298,42 @@ function Copy-FileAtomic {
                 $hash = $h2
             }
 
+            $renamedTo = ''; $oldRemoved = $false
             if ([IO.File]::Exists($Dst)) {
-                [IO.File]::SetAttributes($Dst, [IO.FileAttributes]::Normal)
-                # [NullString] is required: PowerShell turns $null into "" for string args, which Replace rejects
-                [IO.File]::Replace($tmp, $Dst, [NullString]::Value)
+                # 1. Rename the existing target out of the way
+                $old = "$Dst.old_$($script:RunId)"; $n = 1
+                while ([IO.File]::Exists($old)) { $old = "$Dst.old_$($script:RunId)_$n"; $n++ }
+                try { [IO.File]::Move($Dst, $old) }
+                catch { throw "Cannot rename existing target file (check Delete permission): $($_.Exception.Message)" }
+
+                # 2. Put the new copy in its place; if that fails, put the old file back
+                try { [IO.File]::Move($tmp, $Dst) }
+                catch {
+                    try { [IO.File]::Move($old, $Dst) } catch { }
+                    throw
+                }
+                $renamedTo = [IO.Path]::GetFileName($old)
+
+                # 3. Optionally remove the renamed old file; if that is not permitted, leave it in place
+                if (-not $KeepReplaced) {
+                    try {
+                        try { [IO.File]::SetAttributes($old, [IO.FileAttributes]::Normal) } catch { }
+                        [IO.File]::Delete($old)
+                        $oldRemoved = $true
+                    }
+                    catch { }
+                }
             }
             else {
                 [IO.File]::Move($tmp, $Dst)
             }
-            [IO.File]::SetLastWriteTimeUtc($Dst, $mtime)
+            # Keep the source timestamp; not fatal if the target folder doesn't allow it
+            try { [IO.File]::SetLastWriteTimeUtc($Dst, $mtime) } catch { }
 
-            return [pscustomobject]@{ Size = $size; MTime = $mtime.Ticks; Hash = $hash; Attempts = $attempt }
+            return [pscustomobject]@{
+                Size = $size; MTime = $mtime.Ticks; Hash = $hash; Attempts = $attempt
+                RenamedTo = $renamedTo; OldRemoved = $oldRemoved
+            }
         }
         catch {
             try { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } } catch { }
@@ -272,7 +347,7 @@ function Remove-TargetFile {
     param([string]$TargetRoot, [string]$TargetRel, [string]$Mode, [string]$ArchiveRoot)
     $full = [IO.Path]::Combine($TargetRoot, $TargetRel)
     if (-not [IO.File]::Exists($full)) { return 'AlreadyGone' }
-    [IO.File]::SetAttributes($full, [IO.FileAttributes]::Normal)
+    try { [IO.File]::SetAttributes($full, [IO.FileAttributes]::Normal) } catch { }
 
     if ($Mode -eq 'Mirror') {
         [IO.File]::Delete($full)
@@ -325,7 +400,7 @@ function Invoke-MappingSync {
     $nowTicks    = [DateTime]::UtcNow.Ticks
     $minAgeTicks = [TimeSpan]::FromSeconds($s.MinFileAgeSeconds).Ticks
     $tolerance   = [TimeSpan]::FromSeconds(2).Ticks
-    $counts = @{ New = 0; Modified = 0; Repair = 0; Relocate = 0; Adopt = 0; Unchanged = 0; Busy = 0; Delete = 0 }
+    $counts = @{ New = 0; Modified = 0; Repair = 0; Relocate = 0; Adopt = 0; Same = 0; Unchanged = 0; Busy = 0; Delete = 0 }
     $plan   = New-Object System.Collections.Generic.List[object]
 
     # ---- 1. Diff source vs. state (and target) ----
@@ -357,11 +432,19 @@ function Invoke-MappingSync {
             continue
         }
 
+        # Before copying, check whether the target already has the same file/version
+        $sameReason = $null
+        if (@('New', 'Modified', 'Repair') -contains $action) {
+            $sameReason = Test-SameFile -Src $f.Full -Dst $targetFull -Mode $s.CompareMode
+            if ($sameReason) { $action = 'Same' }
+        }
+
         $counts[$action]++
         $oldTargetRel = $null
         if ($null -ne $old) { $oldTargetRel = $old.TargetRel }
         $plan.Add([pscustomobject]@{
             Action = $action; File = $f; TargetRel = $targetRel; TargetFull = $targetFull; OldTargetRel = $oldTargetRel
+            SameReason = $sameReason
         })
     }
 
@@ -384,11 +467,15 @@ function Invoke-MappingSync {
         }
     }
 
-    Write-Log ("[{0}] Plan: New={1} Modified={2} Repair={3} Relocate={4} Adopt={5} Delete={6} Unchanged={7} Deferred={8}" -f `
-        $name, $counts.New, $counts.Modified, $counts.Repair, $counts.Relocate, $counts.Adopt, $counts.Delete, $counts.Unchanged, $counts.Busy)
+    Write-Log ("[{0}] Plan: New={1} Modified={2} Repair={3} Relocate={4} Adopt={5} SameSkipped={6} Delete={7} Unchanged={8} Deferred={9}" -f `
+        $name, $counts.New, $counts.Modified, $counts.Repair, $counts.Relocate, $counts.Adopt, $counts.Same, $counts.Delete, $counts.Unchanged, $counts.Busy)
 
     if ($DryRun) {
-        foreach ($p in $plan) { Add-Change $name $p.Action $p.File.Rel 'DryRun' $p.TargetRel }
+        foreach ($p in $plan) {
+            $detail = $p.TargetRel
+            if ($p.SameReason) { $detail = "Target already up to date ($($p.SameReason)); no copy" }
+            Add-Change $name $p.Action $p.File.Rel 'DryRun' $detail
+        }
         foreach ($d in $deletes) {
             $r = 'DryRun'; if (-not $allowDeletes) { $r = 'Suppressed' }
             Add-Change $name "Delete($($s.DeleteMode))" $d.Rel $r $d.TargetRel
@@ -405,12 +492,25 @@ function Invoke-MappingSync {
                 $state[$f.Rel] = New-StateEntry $f.Rel $p.TargetRel $f.Size $f.MTime '' ''
                 Add-Change $name 'Adopt' $f.Rel 'OK' 'Already present at target'
             }
+            elseif ($p.Action -eq 'Same') {
+                # Target already matches the source: record it as in sync, copy nothing
+                $state[$f.Rel] = New-StateEntry $f.Rel $p.TargetRel $f.Size $f.MTime '' ''
+                Add-Change $name 'SameSkipped' $f.Rel 'OK' "Not copied: $($p.SameReason)"
+            }
             else {
                 $r = Copy-FileAtomic -Src $f.Full -Dst $p.TargetFull -VerifyHash $s.VerifyHash `
-                                     -RetryCount $s.RetryCount -RetryDelay $s.RetryDelaySeconds
+                                     -RetryCount $s.RetryCount -RetryDelay $s.RetryDelaySeconds `
+                                     -KeepReplaced $s.KeepReplacedFiles
                 $state[$f.Rel] = New-StateEntry $f.Rel $p.TargetRel $r.Size $r.MTime $r.Hash ''
                 $detail = '{0:n0} bytes' -f $r.Size
                 if ($r.Attempts -gt 1) { $detail += " after $($r.Attempts) attempts" }
+                if ($r.RenamedTo) {
+                    if ($r.OldRemoved) { $detail += "; previous version renamed to $($r.RenamedTo) then removed" }
+                    else               { $detail += "; previous version kept as $($r.RenamedTo)" }
+                    if (-not $s.KeepReplacedFiles -and -not $r.OldRemoved) {
+                        Write-Log "[$name] Could not remove '$($r.RenamedTo)' (no delete permission); left in place" 'WARN'
+                    }
+                }
 
                 if ($p.Action -eq 'Relocate' -and $p.OldTargetRel -and $s.DeleteMode -ne 'None') {
                     $null = Remove-TargetFile $Inst.Target $p.OldTargetRel $s.DeleteMode $Inst.ArchiveRoot
@@ -518,6 +618,11 @@ try {
             RetryDelaySeconds = [int](Get-Setting $m $defaults 'RetryDelaySeconds' 5)
             MaxDeletePercent  = [double](Get-Setting $m $defaults 'MaxDeletePercent' 20)
             CheckpointEvery   = [int](Get-Setting $m $defaults 'CheckpointEvery' 500)
+            KeepReplacedFiles = [bool](Get-Setting $m $defaults 'KeepReplacedFiles' $true)
+            CompareMode       = [string](Get-Setting $m $defaults 'CompareMode' 'Content')
+        }
+        if (@('Content', 'Version', 'None') -notcontains $settings.CompareMode) {
+            throw "Mapping '$($m.Name)': CompareMode must be Content, Version or None"
         }
         if (@('None', 'Mirror', 'Archive') -notcontains $settings.DeleteMode) {
             throw "Mapping '$($m.Name)': DeleteMode must be None, Mirror or Archive"
