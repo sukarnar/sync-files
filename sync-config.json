@@ -1,0 +1,45 @@
+{
+  "StateDir": "D:\\FileSync\\state",
+  "LogDir": "D:\\FileSync\\logs",
+  "ArchiveDir": "D:\\FileSync\\archive",
+  "LogRetentionDays": 30,
+
+  "Defaults": {
+    "Include": ["*"],
+    "Exclude": ["*.tmp", "~$*", "Thumbs.db", "desktop.ini", "*.synctmp"],
+    "ExcludeDirs": ["$RECYCLE.BIN", "System Volume Information", ".git"],
+    "DeleteMode": "Archive",
+    "MinFileAgeSeconds": 60,
+    "VerifyHash": false,
+    "VerifyTarget": true,
+    "RetryCount": 3,
+    "RetryDelaySeconds": 5,
+    "MaxDeletePercent": 20,
+    "CheckpointEvery": 500
+  },
+
+  "Mappings": [
+    {
+      "Name": "Finance",
+      "Source": "\\\\SRV-OLD01\\D$\\Shares\\Finance",
+      "Target": "E:\\Shares\\Finance"
+    },
+    {
+      "Name": "DeptReports",
+      "Source": "\\\\SRV-OLD01\\D$\\Data\\{Dept}\\Reports",
+      "Target": "E:\\Reports\\{Dept}",
+      "Exclude": ["*.bak"]
+    },
+    {
+      "Name": "AppExports",
+      "Source": "\\\\SRV-OLD01\\E$\\AppExports",
+      "Target": "E:\\Inbound\\AppExports",
+      "Include": ["*.csv", "*.txt", "*.xml"],
+      "DeleteMode": "None",
+      "VerifyHash": true,
+      "PathRules": [
+        { "Match": "^(\\d{4})(\\d{2})\\d{2}_(.+)$", "Replace": "$1\\$2\\$3" }
+      ]
+    }
+  ]
+}
