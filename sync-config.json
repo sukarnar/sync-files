@@ -15,7 +15,10 @@
     "RetryCount": 3,
     "RetryDelaySeconds": 5,
     "MaxDeletePercent": 20,
-    "CheckpointEvery": 500
+    "CheckpointEvery": 500,
+    "KeepReplacedFiles": true,
+    "CompareMode": "Content",
+    "Workers": 4
   },
 
   "Mappings": [
